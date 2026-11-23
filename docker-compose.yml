@@ -1,0 +1,121 @@
+# Proyecto final: proxy inverso Nginx + 3 backends Flask + monitoreo
+# (Prometheus, Grafana, Nginx Prometheus Exporter y cAdvisor)
+name: proyecto-final
+
+# Plantilla común de los tres backends (se reutiliza con <<: *backend)
+x-backend: &backend
+  build: ./backend
+  image: proyecto-backend:1.0
+  restart: unless-stopped
+  networks: [infra-net]
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+    interval: 5s
+    timeout: 3s
+    retries: 5
+    start_period: 3s
+
+services:
+  # ---------- Backends (sin ports: solo se llega a ellos a través de Nginx) ----------
+  app1:
+    <<: *backend
+    environment:
+      SERVER_NAME: "server 1"
+
+  app2:
+    <<: *backend
+    environment:
+      SERVER_NAME: "server 2"
+
+  app3:
+    <<: *backend
+    environment:
+      SERVER_NAME: "server 3"
+
+  # ---------- Proxy inverso y balanceador ----------
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "${NGINX_PORT:-8080}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      app1:
+        condition: service_healthy
+      app2:
+        condition: service_healthy
+      app3:
+        condition: service_healthy
+    networks: [infra-net]
+
+  # ---------- Monitoreo ----------
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:${NGINX_EXPORTER_TAG:-1.4.2}
+    restart: unless-stopped
+    command:
+      - "--nginx.scrape-uri=http://nginx:8088/stub_status"
+    depends_on:
+      - nginx
+    networks: [infra-net]
+
+  cadvisor:
+    image: ghcr.io/google/cadvisor:${CADVISOR_TAG:-0.56.2}
+    restart: unless-stopped
+    command:
+      - "--housekeeping_interval=5s"
+      - "--docker_only=true"
+    ports:
+      - "${CADVISOR_PORT:-8081}:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    privileged: true
+    networks: [infra-net]
+
+  prometheus:
+    image: prom/prometheus:${PROMETHEUS_TAG:-v3.13.5}
+    restart: unless-stopped
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - nginx-exporter
+      - cadvisor
+    networks: [infra-net]
+
+  grafana:
+    image: grafana/grafana:${GRAFANA_TAG:-12.4.0}
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      # Solo para laboratorio local: entra sin usuario y con rol Admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # El dashboard del proyecto es la página de inicio
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/dashboards/proyecto-final.json
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/etc/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks: [infra-net]
+
+# Red Docker personalizada: todos los contenedores se ven por nombre de servicio
+networks:
+  infra-net:
+    name: infra-net
+    driver: bridge
+
+# Volúmenes con nombre: los datos sobreviven a docker compose down
+volumes:
+  prometheus_data:
+  grafana_data:
